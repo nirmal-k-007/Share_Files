@@ -6,15 +6,33 @@ import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
 import java.net.InetAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.UnknownHostException;
+import java.nio.charset.StandardCharsets;
+import java.security.KeyFactory;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.MessageDigest;
+import java.security.PublicKey;
+import java.security.spec.X509EncodedKeySpec;
+import java.util.Arrays;
+
+import javax.crypto.KeyAgreement;
+import javax.crypto.SecretKey;
+import javax.crypto.interfaces.DHPublicKey;
+import javax.crypto.spec.DHParameterSpec;
+import javax.crypto.spec.SecretKeySpec;
 import javax.swing.*;
+
 
 public class Receive extends JFrame {
 
-    Label serverStatus, clientStatus, ip, total, current, locLabel, nameLabel, progressLabel, progress;
+    Label serverStatus, clientStatus, ip, total, current, locLabel, nameLabel, progressLabel, progress, key;
     JProgressBar progressBar;
     TextField locField;
     Button saveLoc;
@@ -24,6 +42,7 @@ public class Receive extends JFrame {
     DataOutputStream dos;
     InetAddress localHost;
     boolean flag;
+    boolean broadcastFlag = true;
 
     public Receive() {
         flag = false;
@@ -50,6 +69,9 @@ public class Receive extends JFrame {
         current = new Label("Current : -");
         add(current);
         current.setVisible(false);
+        key = new Label("Key : ");
+        add(key);
+        key.setVisible(false);
         nameLabel = new Label("File Name : ");
         add(nameLabel);
         nameLabel.setVisible(false);
@@ -72,12 +94,17 @@ public class Receive extends JFrame {
             System.out.println("Some Error!!");
         }
 
+        
+
         Thread cli = new Thread(new Runnable() {
             public void run() {
                 try {
                     socket = serverSocket.accept();
                     dis = new DataInputStream(socket.getInputStream());
                     dos = new DataOutputStream(socket.getOutputStream());
+
+                    
+
                     String saveDir = locField.getText().trim();
                     SwingUtilities.invokeLater(() -> {
                         clientStatus.setText("Client Status : Client Connected!");
@@ -89,10 +116,20 @@ public class Receive extends JFrame {
                         progressLabel.setVisible(true);
                         // progress.setVisible(true);
                         progressBar.setVisible(true);
+                        key.setVisible(true);
                     });
+                    broadcastFlag = false;
+
+                    // DH key exchange (receiver starts)
+                SecretKey aesKey = performDhAndDeriveAesKeyAsReceiver(dis, dos);
+                System.out.println("Derived AES key (receiver): " + bytesToHex(aesKey.getEncoded()));
+                key.setText("Key : " + bytesToHex(aesKey.getEncoded()));
+
 
                     // receive no of files
-                    int n = dis.readInt();
+                    int n = Integer.parseInt(dis.readUTF());
+
+                    System.out.println("n = " + n);
 
                     SwingUtilities.invokeLater(() -> {
                         total.setText("Total : " + n);
@@ -107,6 +144,9 @@ public class Receive extends JFrame {
                         });
                         // receive file name
                         String fileName = dis.readUTF();
+
+                        System.out.println("name = " + fileName);
+
                         System.out.println("Name : " + fileName);
                         SwingUtilities.invokeLater(() -> {
                             nameLabel.setText("File Name : " + sliceFirst30(fileName) + "...");
@@ -115,6 +155,7 @@ public class Receive extends JFrame {
 
                         // receive file size
                         long size = dis.readLong();
+
                         System.out.println("Size : " + size);
 
                         // receive file bytes
@@ -152,6 +193,30 @@ public class Receive extends JFrame {
                 }
             }
         });
+        Thread broadCast = new Thread(new Runnable() {
+            public void run(){
+                DatagramSocket skt;
+                try {
+                    skt = new DatagramSocket();
+                    skt.setBroadcast(true);
+                    String message = localHost.getHostAddress();
+                    byte[] buffer = message.getBytes(StandardCharsets.UTF_8);
+                    InetAddress broadCastAddress = InetAddress.getByName("255.255.255.255");
+                    int port = 5000;
+
+                    while(broadcastFlag){
+                        DatagramPacket pkt = new DatagramPacket(buffer, buffer.length, broadCastAddress, port);
+                        skt.send(pkt);
+                        System.out.println("Broadcast Sent!!");
+                        Thread.sleep(2000);
+                    }
+
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                
+            }
+        });
 
         saveLoc.addActionListener(e -> {
             SwingUtilities.invokeLater(() -> {
@@ -177,6 +242,7 @@ public class Receive extends JFrame {
                         } catch (Exception ex) {
                             serverStatus.setText("Server Status : Failed to Start Server...");
                         }
+                        broadCast.start();
                         cli.start();
                     }
                 }
@@ -203,6 +269,41 @@ public class Receive extends JFrame {
         });
 
         setVisible(true);
+    }
+
+    private SecretKey performDhAndDeriveAesKeyAsReceiver(DataInputStream in, DataOutputStream out) throws Exception {
+        KeyPairGenerator kpg = KeyPairGenerator.getInstance("DH");
+        kpg.initialize(2048);
+        KeyPair kp = kpg.generateKeyPair();
+
+        byte[] receiverPubEnc = kp.getPublic().getEncoded();
+        out.writeInt(receiverPubEnc.length);
+        out.write(receiverPubEnc);
+        out.flush();
+
+        int len = in.readInt();
+        byte[] senderPubEnc = new byte[len];
+        in.readFully(senderPubEnc);
+
+        KeyFactory keyFac = KeyFactory.getInstance("DH");
+        X509EncodedKeySpec x509KeySpec = new X509EncodedKeySpec(senderPubEnc);
+        PublicKey senderPubKey = keyFac.generatePublic(x509KeySpec);
+
+        KeyAgreement keyAgree = KeyAgreement.getInstance("DH");
+        keyAgree.init(kp.getPrivate());
+        keyAgree.doPhase(senderPubKey, true);
+        byte[] sharedSecret = keyAgree.generateSecret();
+
+        MessageDigest sha256 = MessageDigest.getInstance("SHA-256");
+        byte[] keyBytes = sha256.digest(sharedSecret);
+        byte[] aesKeyBytes = Arrays.copyOf(keyBytes, 16);
+        return new SecretKeySpec(aesKeyBytes, "AES");
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) sb.append(String.format("%02x", b));
+        return sb.toString();
     }
 
     public static String prog(int percent) {
